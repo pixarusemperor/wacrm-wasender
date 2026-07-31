@@ -47,15 +47,27 @@ jobs:
         env:
           COOLIFY_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+          COOLIFY_WEBHOOK: ${{ secrets.COOLIFY_WEBHOOK }}
           COOLIFY_URL: ${{ secrets.COOLIFY_BASE_URL }}
         run: |
           set -euo pipefail
+          BASE="${COOLIFY_URL:-https://coolifyone.orizongroup.online}"
+
+          # Preferred: the per-app Deploy Webhook URL (official GitHub
+          # Actions pattern — a GET triggers the deploy, no UUID needed).
+          if [ -n "${COOLIFY_WEBHOOK}" ]; then
+            echo "==> Triggering via COOLIFY_WEBHOOK"
+            RESPONSE=$(curl -sk -S --fail-with-body -X GET "${COOLIFY_WEBHOOK}")
+            echo "${RESPONSE}" | jq . || echo "${RESPONSE}"
+            exit 0
+          fi
+
+          # Fallback: POST /api/v1/deploy with the app UUID.
           if [ -z "${COOLIFY_TOKEN}" ] || [ -z "${APP_UUID}" ]; then
-            echo "::error::Missing COOLIFY_API_TOKEN or COOLIFY_APP_UUID secret"
+            echo "::error::Missing COOLIFY_WEBHOOK, or COOLIFY_API_TOKEN + COOLIFY_APP_UUID"
             exit 1
           fi
-          BASE="${COOLIFY_URL:-https://coolifyone.orizongroup.online}"
-          echo "==> Deploying app ${APP_UUID}"
+          echo "==> Deploying app ${APP_UUID} via API"
           RESPONSE=$(curl -sk -S --fail-with-body \
             -X POST \
             -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
@@ -72,6 +84,7 @@ jobs:
         id: trigger
 
       - name: Wait for deployment
+        if: ${{ secrets.COOLIFY_APP_UUID != '' }}
         env:
           COOLIFY_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
