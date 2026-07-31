@@ -1,0 +1,97 @@
+name: Deploy to Coolify
+
+# Runs after CI passes on main, deploys the fork to Coolify.
+# Uses the MODERN Coolify deploy endpoint (POST /api/v1/deploy) — the
+# old PATCH /applications/{uuid} pattern was proven broken (see
+# docs/adr/sessions/2026-06-15.md).
+#
+# Required repo secrets:
+#   COOLIFY_API_TOKEN — Coolify API token (deploy permission), value "1|<token>"
+#   COOLIFY_APP_UUID  — the wacrm-wasender application UUID in Coolify
+#   COOLIFY_BASE_URL  — https://coolifyone.orizongroup.online
+#
+# The app must already exist in Coolify (public repo, Dockerfile build
+# pack, port 3000) — see scripts/coolify-create-app.sh.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: coolify-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:flows
+
+      - name: Trigger Coolify deploy
+        env:
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+          COOLIFY_URL: ${{ secrets.COOLIFY_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COOLIFY_TOKEN}" ] || [ -z "${APP_UUID}" ]; then
+            echo "::error::Missing COOLIFY_API_TOKEN or COOLIFY_APP_UUID secret"
+            exit 1
+          fi
+          BASE="${COOLIFY_URL:-https://coolifyone.orizongroup.online}"
+          echo "==> Deploying app ${APP_UUID}"
+          RESPONSE=$(curl -sk -S --fail-with-body \
+            -X POST \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"uuid\": \"${APP_UUID}\"}" \
+            "${BASE}/api/v1/deploy")
+          echo "${RESPONSE}" | jq .
+          DEPLOY_UUID=$(echo "${RESPONSE}" | jq -r '.deployments[0].uuid // .deployment_uuid // empty')
+          if [ -z "${DEPLOY_UUID}" ]; then
+            echo "::error::No deployment UUID returned — is the token scoped to deploy?"
+            exit 1
+          fi
+          echo "deployment_uuid=${DEPLOY_UUID}" >> "$GITHUB_OUTPUT"
+        id: trigger
+
+      - name: Wait for deployment
+        env:
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+          COOLIFY_URL: ${{ secrets.COOLIFY_BASE_URL }}
+        run: |
+          set -euo pipefail
+          BASE="${COOLIFY_URL:-https://coolifyone.orizongroup.online}"
+          MAX_ATTEMPTS=40
+          INTERVAL=15
+          for i in $(seq 1 ${MAX_ATTEMPTS}); do
+            RESPONSE=$(curl -sk -S \
+              -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+              "${BASE}/api/v1/deployments/applications/${APP_UUID}")
+            STATUS=$(echo "${RESPONSE}" | jq -r '.deployments[0].status // "unknown"')
+            echo "[${i}/${MAX_ATTEMPTS}] status=${STATUS}"
+            case "${STATUS}" in
+              finished) echo "::notice::DEPLOY SUCCEEDED"; exit 0 ;;
+              failed)   echo "::error::DEPLOY FAILED"; echo "${RESPONSE}" | jq .; exit 1 ;;
+              *)        sleep ${INTERVAL} ;;
+            esac
+          done
+          echo "::error::TIMEOUT — deployment did not finish in 10 minutes"
+          exit 1
