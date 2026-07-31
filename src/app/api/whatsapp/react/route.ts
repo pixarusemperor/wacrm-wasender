@@ -1,8 +1,5 @@
 import { NextResponse } from 'next/server';
 import { requireRole, toErrorResponse } from '@/lib/auth/account';
-import { sendReactionMessage } from '@/lib/whatsapp/meta-api';
-import { decrypt } from '@/lib/whatsapp/encryption';
-import { sanitizePhoneForMeta } from '@/lib/whatsapp/phone-utils';
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -55,74 +52,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Message not found' }, { status: 404 });
     }
 
-    if (!targetMessage.message_id) {
-      // No Meta ID yet — usually a sending/failed agent message. We can't
-      // tell Meta to react to a message it never received.
-      return NextResponse.json(
-        { error: 'Cannot react to a message that has not been sent to WhatsApp' },
-        { status: 400 },
-      );
-    }
-
-    const { data: conversation, error: convError } = await supabase
-      .from('conversations')
-      .select('id, account_id, contact:contacts(phone)')
-      .eq('id', targetMessage.conversation_id)
-      .eq('account_id', accountId)
-      .maybeSingle();
-
-    if (convError || !conversation) {
-      return NextResponse.json(
-        { error: 'Conversation not found' },
-        { status: 404 },
-      );
-    }
-
-    const contact = Array.isArray(conversation.contact)
-      ? conversation.contact[0]
-      : conversation.contact;
-    if (!contact?.phone) {
-      return NextResponse.json(
-        { error: 'Contact phone number not found' },
-        { status: 400 },
-      );
-    }
-
-    // WhatsApp config + access token. Account-scoped post-multi-user.
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('phone_number_id, access_token')
-      .eq('account_id', accountId)
-      .single();
-
-    if (configError || !config) {
-      return NextResponse.json(
-        { error: 'WhatsApp not configured.' },
-        { status: 400 },
-      );
-    }
-
-    const accessToken = decrypt(config.access_token);
-    const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
-
-    try {
-      await sendReactionMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: sanitizedPhone,
-        targetMessageId: targetMessage.message_id,
-        emoji,
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Unknown Meta API error';
-      console.error('[whatsapp/react] Meta send failed:', message);
-      return NextResponse.json(
-        { error: `Meta API error: ${message}` },
-        { status: 502 },
-      );
-    }
-
+    // WasenderApi has no send-reaction endpoint — reactions are
+    // mirrored locally only (customer reactions arrive via webhook).
     // Mirror into DB. Empty emoji = removal.
     if (emoji === '') {
       const { error: delError } = await supabase
@@ -135,13 +66,11 @@ export async function POST(request: Request) {
       if (delError) {
         console.error('[whatsapp/react] DB delete failed:', delError.message);
         return NextResponse.json(
-          { error: 'Reaction sent to Meta but DB delete failed' },
+          { error: 'Reaction removal failed' },
           { status: 500 },
         );
       }
     } else {
-      // Upsert. The unique constraint (message_id, actor_type, actor_id)
-      // lets us swap emoji in a single statement.
       const { error: upsertError } = await supabase.from('message_reactions').upsert(
         {
           message_id: targetMessage.id,
@@ -156,7 +85,7 @@ export async function POST(request: Request) {
       if (upsertError) {
         console.error('[whatsapp/react] DB upsert failed:', upsertError.message);
         return NextResponse.json(
-          { error: 'Reaction sent to Meta but DB upsert failed' },
+          { error: 'Reaction save failed' },
           { status: 500 },
         );
       }
@@ -164,8 +93,6 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    // requireRole throws Unauthorized/Forbidden; toErrorResponse maps
-    // those to 401/403 and collapses anything else to a generic 500.
     console.error('Error in WhatsApp react POST:', error);
     return toErrorResponse(error);
   }

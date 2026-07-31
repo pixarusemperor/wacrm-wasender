@@ -23,27 +23,22 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
   sendTextMessage,
-  sendTemplateMessage,
   sendMediaMessage,
   sendInteractiveButtons,
   sendInteractiveList,
-  type MediaKind,
-} from '@/lib/whatsapp/meta-api';
+  resolveSessionApiKey,
+} from '@/lib/whatsapp/wasender-send';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
-import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
   isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
-import type { MessageTemplate } from '@/types';
-import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
+import type { MediaKind } from '@/lib/whatsapp/wasender-types';
 
 export const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const;
 export const VALID_MESSAGE_TYPES = [
@@ -247,198 +242,79 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
-
-  if (configError || !config) {
-    throw new SendMessageError(
-      'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
-      400
-    );
-  }
-
-  const accessToken = decrypt(config.access_token);
-
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
-      });
-  }
-
-  // Resolve the reply target to its Meta message_id. The parent must
-  // belong to this same conversation — otherwise a caller could quote
-  // messages they can't see by guessing UUIDs.
-  let contextMessageId: string | undefined;
-  if (replyToMessageId) {
-    const { data: parent, error: parentError } = await db
-      .from('messages')
-      .select('message_id, conversation_id')
-      .eq('id', replyToMessageId)
-      .eq('conversation_id', conversationId)
-      .maybeSingle();
-
-    if (parentError || !parent) {
-      throw new SendMessageError(
-        'bad_request',
-        'reply_to_message_id not found in this conversation',
-        400
-      );
-    }
-    if (!parent.message_id) {
-      console.warn(
-        '[send-message] reply target has no Meta message_id; sending without context'
-      );
-    } else {
-      contextMessageId = parent.message_id;
-    }
-  }
-
-  // Template row (for header + button components). isMessageTemplate
-  // guards against a malformed local row crashing the send-builder.
-  let templateRow: MessageTemplate | null = null;
-  if (messageType === 'template' && templateName) {
-    const { data } = await db
-      .from('message_templates')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('name', templateName)
-      .eq('language', templateLanguage || 'en_US')
-      .maybeSingle();
-    if (data && !isMessageTemplate(data)) {
-      throw new SendMessageError(
-        'template_malformed',
-        'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
-        500
-      );
-    }
-    templateRow = data ?? null;
-  }
+  // WhatsApp config → wasender session, account-scoped.
+  // WasenderApi credentials live on `wasender_sessions` (encrypted
+  // per-session key), not `whatsapp_config` (Meta).
+  const sessionApiKey = await resolveSessionApiKey(db, accountId);
 
   const attempt = async (phone: string): Promise<string> => {
     if (messageType === 'template') {
-      const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        templateName: templateName!,
-        language: templateLanguage || 'en_US',
-        template: templateRow ?? undefined,
-        messageParams: templateMessageParams ?? undefined,
-        params: templateParams || [],
-        contextMessageId,
-      });
-      return result.messageId;
+      throw new SendMessageError(
+        'wasender_unsupported',
+        'Template messages are not supported by WasenderApi. Use a text or media message.',
+        400
+      );
     }
     if (isMediaKind) {
       const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
+        sessionApiKey,
         to: phone,
         kind: messageType as MediaKind,
         link: mediaUrl!,
         caption: contentText || undefined,
         filename: filename || undefined,
-        contextMessageId,
       });
       return result.messageId;
     }
     if (messageType === 'interactive') {
+      // WasenderApi has no interactive buttons — render a numbered
+      // text menu instead. The reply routes through the same
+      // collect_input / condition machinery as a button tap.
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
-          accessToken,
+          sessionApiKey,
           to: phone,
           bodyText: p.body,
           headerText: p.header || undefined,
           footerText: p.footer || undefined,
           buttons: p.buttons,
-          contextMessageId,
         });
         return result.messageId;
       }
       const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
+        sessionApiKey,
         to: phone,
         bodyText: p.body,
         buttonLabel: p.button_label,
         headerText: p.header || undefined,
         footerText: p.footer || undefined,
         sections: p.sections,
-        contextMessageId,
       });
       return result.messageId;
     }
     const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
+      sessionApiKey,
       to: phone,
       text: contentText!,
-      contextMessageId,
     });
     return result.messageId;
   };
 
-  // Send via Meta — retry across phone-number variants if Meta rejects
-  // with "recipient not in allowed list"; persist a working variant
-  // back to the contact so the next send goes straight through.
+  // Send via WasenderApi. The API accepts E.164 directly, so the
+  // phone-variant retry is unnecessary — keep a single attempt.
   let waMessageId = '';
-  let workingPhone = sanitizedPhone;
   try {
-    const variants = phoneVariants(sanitizedPhone);
-    let lastError: unknown = null;
-
-    for (const variant of variants) {
-      try {
-        waMessageId = await attempt(variant);
-        workingPhone = variant;
-        lastError = null;
-        break;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (!isRecipientNotAllowedError(message)) {
-          throw err;
-        }
-        lastError = err;
-        console.warn(
-          `[send-message] variant "${variant}" rejected by Meta, trying next…`
-        );
-      }
-    }
-
-    if (lastError) throw lastError;
+    waMessageId = await attempt(sanitizedPhone);
   } catch (err) {
     const message =
-      err instanceof Error ? err.message : 'Unknown Meta API error';
-    console.error('[send-message] Meta send failed for all variants:', message);
-    throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+      err instanceof Error ? err.message : 'Unknown WasenderApi error';
+    console.error('[send-message] WasenderApi send failed:', message);
+    throw new SendMessageError('provider_error', `WasenderApi error: ${message}`, 502);
   }
 
-  if (workingPhone !== sanitizedPhone) {
-    console.log(
-      `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
-    );
-    await db
-      .from('contacts')
-      .update({ phone: workingPhone })
-      .eq('id', contact.id);
-  }
+  // (replyToMessageId context resolution removed — WasenderApi's
+  // replyTo takes the provider msgId, which we don't persist yet.)
 
   // Persist the sent message. Field names MUST match the messages
   // schema (see 001_initial_schema.sql).

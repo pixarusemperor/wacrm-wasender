@@ -55,19 +55,14 @@ export async function POST(request: Request) {
       return fail('bad_request', 'Request body must be a JSON object', 400);
     }
 
-    const templateName =
-      typeof body.template_name === 'string' ? body.template_name : '';
+    const text = typeof body.text === 'string' ? body.text : '';
     const recipients = Array.isArray(body.recipients) ? body.recipients : [];
 
     const auditUserId = await resolveAuditUserId(ctx.supabase, ctx.accountId);
 
     const plan = await createBroadcast(ctx.supabase, ctx.accountId, auditUserId, {
       name: typeof body.name === 'string' ? body.name : null,
-      templateName,
-      templateLanguage:
-        typeof body.template_language === 'string'
-          ? body.template_language
-          : null,
+      text,
       recipients: recipients.map((r) => ({
         to: typeof r?.to === 'string' ? r.to : '',
         params: Array.isArray(r?.params) ? r.params : undefined,

@@ -56,9 +56,15 @@ import {
   type SendMediaNodeConfig,
   type SendMessageNodeConfig,
   type SetTagNodeConfig,
+  type SplitTestNodeConfig,
   type StartNodeConfig,
   type KeywordTriggerConfig,
 } from "./types";
+import {
+  selectVariantForContact,
+  type ContactKey,
+  type SplitVariant,
+} from "./split-test";
 
 // ============================================================
 // Pure helpers — extracted so engine.test.ts can exercise them
@@ -118,7 +124,8 @@ export function isAutoAdvancing(node_type: string): boolean {
     node_type === "send_message" ||
     node_type === "send_media" ||
     node_type === "condition" ||
-    node_type === "set_tag"
+    node_type === "set_tag" ||
+    node_type === "split_test"
   );
 }
 
@@ -257,6 +264,7 @@ async function logEvent(
     | "fallback_fired"
     | "handoff"
     | "timeout"
+    | "split_test_assigned"
     | "error"
     | "completed",
   node_key: string | null,
@@ -736,6 +744,42 @@ async function advanceFromNodeKey(
         });
       }
       currentKey = cfg.next_node_key;
+      continue;
+    }
+    if (node.node_type === "split_test") {
+      // A/B routing — pick a variant deterministically per contact and
+      // advance to its target node. Logs to flow_split_test_sends for
+      // response-rate attribution.
+      const cfg = node.config as unknown as SplitTestNodeConfig;
+      const variants: SplitVariant[] = cfg.variants.map((v) => ({
+        targetNodeKey: v.target_node_key,
+        name: v.name,
+        weight: v.weight ?? 1,
+      }));
+      const chosen = selectVariantForContact(
+        variants,
+        run.contact_id as ContactKey
+      );
+
+      await logEvent(db, run.id, "split_test_assigned", node.node_key, {
+        variant: chosen.name,
+        target_node_key: chosen.targetNodeKey,
+      });
+
+      // Log the send for response-rate stats (best-effort).
+      try {
+        await db.from("flow_split_test_sends").insert({
+          account_id: run.account_id,
+          contact_id: run.contact_id,
+          flow_id: run.flow_id,
+          split_test_id: null, // variant rows link via node_key when present
+          sent_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.warn("[flows] split_test_sends insert failed:", err);
+      }
+
+      currentKey = chosen.targetNodeKey;
       continue;
     }
     if (node.node_type === "send_buttons") {

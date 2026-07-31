@@ -1,20 +1,14 @@
 import {
+  sendTextMessage,
+  sendMediaMessage,
   sendInteractiveButtons,
   sendInteractiveList,
-  sendMediaMessage,
-  sendTextMessage,
-  type InteractiveButton,
-  type InteractiveListSection,
-  type MediaKind,
-} from '@/lib/whatsapp/meta-api'
-import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
-import { decrypt } from '@/lib/whatsapp/encryption'
-import {
-  sanitizePhoneForMeta,
-  isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
-} from '@/lib/whatsapp/phone-utils'
+  resolveSessionApiKey,
+  type WasenderSendResult,
+} from '@/lib/whatsapp/wasender-send'
+import type { InteractiveButton, InteractiveListSection } from '@/lib/whatsapp/interactive'
+import type { MediaKind } from '@/lib/whatsapp/wasender-types'
+import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils'
 import { supabaseAdmin } from './admin-client'
 
 // ------------------------------------------------------------
@@ -82,48 +76,17 @@ export async function engineSendText(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
-  }
+  // Resolve the account's connected WasenderApi session key.
+  const sessionApiKey = await resolveSessionApiKey(db, args.accountId)
 
-  const accessToken = decrypt(config.access_token)
-
-  const attempt = async (phone: string): Promise<string> => {
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: args.text,
-    })
-    return r.messageId
-  }
-
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
-  let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
-    }
-  }
-  if (lastError) throw lastError
-
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
-  }
+  // Send via WasenderApi (no phone-variant retry needed — the API
+  // accepts E.164 directly).
+  const res: WasenderSendResult = await sendTextMessage({
+    sessionApiKey,
+    to: sanitized,
+    text: args.text,
+  })
+  const waMessageId = res.messageId
 
   const { error: msgErr } = await db.from('messages').insert({
     conversation_id: args.conversationId,
@@ -135,7 +98,7 @@ export async function engineSendText(
     ai_generated: args.aiGenerated ?? false,
   })
   if (msgErr) {
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
+    throw new Error(`sent to WasenderApi but DB insert failed: ${msgErr.message}`)
   }
 
   await db
@@ -192,51 +155,18 @@ export async function engineSendMedia(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
-  }
+  // Resolve the account's connected WasenderApi session key.
+  const sessionApiKey = await resolveSessionApiKey(db, args.accountId)
 
-  const accessToken = decrypt(config.access_token)
-
-  const attempt = async (phone: string): Promise<string> => {
-    const r = await sendMediaMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      kind: args.kind,
-      link: args.link,
-      caption: args.caption,
-      filename: args.filename,
-    })
-    return r.messageId
-  }
-
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
-  let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
-    }
-  }
-  if (lastError) throw lastError
-
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
-  }
+  const res: WasenderSendResult = await sendMediaMessage({
+    sessionApiKey,
+    to: sanitized,
+    kind: args.kind,
+    link: args.link,
+    caption: args.caption,
+    filename: args.filename,
+  })
+  const waMessageId = res.messageId
 
   // content_type='image'|'video'|'document' — these are already in the
   // messages_content_type_check constraint (migration 001 + 010).
@@ -252,7 +182,7 @@ export async function engineSendMedia(
     status: 'sent',
   })
   if (msgErr) {
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
+    throw new Error(`sent to WasenderApi but DB insert failed: ${msgErr.message}`)
   }
 
   await db
@@ -326,9 +256,6 @@ async function sendInteractiveViaMeta(
 ): Promise<{ whatsapp_message_id: string }> {
   const db = supabaseAdmin()
 
-  // Scope the contact + whatsapp_config lookups by account_id —
-  // same defense-in-depth rationale as automations/meta-send.ts.
-  // Migration 017 moved both tables to account-scoped tenancy.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
     .select('id, phone')
@@ -344,108 +271,45 @@ async function sendInteractiveViaMeta(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
-  }
+  // WasenderApi has no interactive buttons — sendInteractiveButtons /
+  // sendInteractiveList render a numbered TEXT menu instead. The
+  // customer replies with a number, which the flow's collect_input +
+  // condition machinery routes exactly like a button tap.
+  const sessionApiKey = await resolveSessionApiKey(db, input.accountId)
 
-  const accessToken = decrypt(config.access_token)
-
-  const attempt = async (phone: string): Promise<string> => {
-    if (input.kind === 'buttons') {
-      const r = await sendInteractiveButtons({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        bodyText: input.bodyText,
-        buttons: input.buttons,
-        headerText: input.headerText,
-        footerText: input.footerText,
-      })
-      return r.messageId
-    }
-    const r = await sendInteractiveList({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      bodyText: input.bodyText,
-      buttonLabel: input.buttonLabel,
-      sections: input.sections,
-      headerText: input.headerText,
-      footerText: input.footerText,
-    })
-    return r.messageId
-  }
-
-  // Same phone-variant retry as automations/meta-send.ts. Numbers
-  // registered with/without a trunk 0 + Meta's sandbox quirks all
-  // need this to reliably land a message.
-  const variants = phoneVariants(sanitized)
-  let workingPhone = sanitized
-  let waMessageId = ''
-  let lastError: unknown = null
-  for (const v of variants) {
-    try {
-      waMessageId = await attempt(v)
-      workingPhone = v
-      lastError = null
-      break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
-    }
-  }
-  if (lastError) throw lastError
-
-  if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
-  }
-
-  // Persist the bot's prompt to the messages table so it appears in
-  // the inbox. content_type='interactive' is supported as of
-  // migration 010; sender_type='bot' distinguishes flow sends from
-  // manual agent sends (the conversation list preview will pick up
-  // last_message_text as a sensible summary).
-  //
-  // We do NOT set interactive_reply_id here — that column is reserved
-  // for the customer's tap on this message, populated by the webhook
-  // when their reply arrives. We DO persist the structured payload so
-  // the inbox thread re-renders the buttons/rows the bot sent (round-
-  // trip), matching the composer + automation send paths.
-  const interactivePayload: InteractiveMessagePayload =
+  const res: WasenderSendResult =
     input.kind === 'buttons'
-      ? {
-          kind: 'buttons',
-          body: input.bodyText,
-          header: input.headerText,
-          footer: input.footerText,
+      ? await sendInteractiveButtons({
+          sessionApiKey,
+          to: sanitized,
+          bodyText: input.bodyText,
+          headerText: input.headerText,
+          footerText: input.footerText,
           buttons: input.buttons,
-        }
-      : {
-          kind: 'list',
-          body: input.bodyText,
-          header: input.headerText,
-          footer: input.footerText,
-          button_label: input.buttonLabel,
+        })
+      : await sendInteractiveList({
+          sessionApiKey,
+          to: sanitized,
+          bodyText: input.bodyText,
+          buttonLabel: input.buttonLabel,
           sections: input.sections,
-        }
+          headerText: input.headerText,
+          footerText: input.footerText,
+        })
+  const waMessageId = res.messageId
 
+  // Persist the bot's prompt as a plain-text message (the text-menu
+  // fallback). The customer's numbered reply will advance the flow.
   const { error: msgErr } = await db.from('messages').insert({
     conversation_id: input.conversationId,
     sender_type: 'bot',
-    content_type: 'interactive',
+    content_type: 'text',
     content_text: input.bodyText,
-    interactive_payload: interactivePayload,
     message_id: waMessageId,
     status: 'sent',
   })
   if (msgErr) {
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
+    throw new Error(`sent to WasenderApi but DB insert failed: ${msgErr.message}`)
   }
 
   await db

@@ -177,6 +177,31 @@ export interface SetTagNodeConfig {
 export type EndNodeConfig = Record<string, never>;
 
 /**
+ * A/B split-test routing node.
+ *
+ * WasenderApi has no interactive buttons, so WaCRM's send_buttons /
+ * send_list nodes render as numbered text menus. Split-testing is the
+ * one place where we DO want routing on the SEND side (before any
+ * customer reply): the runner picks a variant deterministically per
+ * contact (see split-test.ts) and advances to that variant's target
+ * node. `flow_split_tests` rows record the variant defs; sends are
+ * logged to `flow_split_test_sends` for response-rate attribution.
+ */
+export interface SplitTestNodeConfig {
+  /** Internal name, e.g. "Landing copy A/B". */
+  name: string;
+  /**
+   * The variant arms. Each routes the run to a different node_key.
+   * Weights bias the distribution (default uniform).
+   */
+  variants: Array<{
+    target_node_key: string;
+    name: string;
+    weight?: number;
+  }>;
+}
+
+/**
  * Total union — every concrete node_type the v1 engine understands.
  * Add new node types here and the engine's switch will flag missing
  * cases via TypeScript's exhaustiveness check.
@@ -194,6 +219,7 @@ export type FlowNodeConfig =
   | { node_type: "condition"; config: ConditionNodeConfig }
   | { node_type: "set_tag"; config: SetTagNodeConfig }
   | { node_type: "handoff"; config: HandoffNodeConfig }
+  | { node_type: "split_test"; config: SplitTestNodeConfig }
   | { node_type: "end"; config: EndNodeConfig };
 
 export type FlowNodeType = FlowNodeConfig["node_type"];

@@ -7,10 +7,10 @@ import { createBroadcast, BroadcastError } from './broadcast-core';
 const db = {} as SupabaseClient;
 
 describe('createBroadcast validation', () => {
-  it('rejects a missing template_name', async () => {
+  it('rejects a missing text body', async () => {
     await expect(
       createBroadcast(db, 'acc', 'user', {
-        templateName: '',
+        text: '',
         recipients: [{ to: '+14155550123' }],
       })
     ).rejects.toMatchObject({ code: 'bad_request', status: 400 });
@@ -19,7 +19,7 @@ describe('createBroadcast validation', () => {
   it('rejects an empty recipient list', async () => {
     await expect(
       createBroadcast(db, 'acc', 'user', {
-        templateName: 'promo',
+        text: 'hello',
         recipients: [],
       })
     ).rejects.toBeInstanceOf(BroadcastError);
@@ -30,7 +30,7 @@ describe('createBroadcast validation', () => {
       to: '+14155550123',
     }));
     await expect(
-      createBroadcast(db, 'acc', 'user', { templateName: 'promo', recipients })
+      createBroadcast(db, 'acc', 'user', { text: 'hello', recipients })
     ).rejects.toMatchObject({ status: 400 });
   });
 });

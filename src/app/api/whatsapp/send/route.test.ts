@@ -1,25 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // ---------------------------------------------------------------------------
-// Tests for the `contact_id` send path (issue #296): sending an approved
-// template to a single contact from the Contact detail view. The route must
-// find-or-create the contact's conversation server-side, then run the normal
-// send + persistence path — no inbound message required to bootstrap a thread.
+// Tests for the `contact_id` send path (issue #296): sending a message to a
+// single contact from the Contact detail view. The route must find-or-create
+// the contact's conversation server-side, then run the normal send +
+// persistence path — no inbound message required to bootstrap a thread.
 // ---------------------------------------------------------------------------
 
-// Records of what the route wrote, so we can assert the right rows landed.
 const conversationInserts: Array<Record<string, unknown>> = []
 const messageInserts: Array<Record<string, unknown>> = []
 
-// Toggles for the per-test scenario.
 let existingConversation: Record<string, unknown> | null = null
 let contactRow: Record<string, unknown> | null = null
-// The caller's role, as `requireRole` reads it off the profile. Sending
-// requires 'agent'; 'viewer' must be refused before anything reaches Meta.
 let callerRole: string = 'admin'
-// A conversation created during the request becomes retrievable by id —
-// the shared send core re-loads the conversation (with its contact) from
-// just the id, so the mock must model insert-then-select-by-id.
 let createdConversation: Record<string, unknown> | null = null
 
 const CONTACT = {
@@ -28,9 +21,16 @@ const CONTACT = {
   phone: '+15551234567',
 }
 
-// Chainable Supabase mock. A fresh builder per `.from()` call tracks whether
-// `.insert()` ran so the terminal resolves to the inserted row for creates
-// and the canned select row otherwise.
+// Encrypted session key value (decrypt is mocked to return 'plaintext-token',
+// but resolveSessionApiKey reads the row then decrypts).
+const SESSION_ROW = {
+  id: 'sess-1',
+  account_id: 'acct-1',
+  wats_api_key: 'enc-session-key',
+  wats_webhook_secret: 'enc-wh-secret',
+  status: 'connected',
+}
+
 function makeSupabaseMock() {
   function builder(table: string) {
     let didInsert = false
@@ -47,21 +47,10 @@ function makeSupabaseMock() {
         case 'contacts':
           return { data: contactRow, error: null }
         case 'conversations':
-          // Once created this request, a by-id reload returns it (with
-          // its contact); otherwise fall back to the canned existing row.
           return { data: createdConversation ?? existingConversation, error: null }
-        case 'whatsapp_config':
-          return {
-            data: {
-              id: 'cfg-1',
-              account_id: 'acct-1',
-              phone_number_id: 'PNID-1',
-              access_token: 'enc-token',
-            },
-            error: null,
-          }
-        case 'message_templates':
-          return { data: null, error: null }
+        case 'wasender_sessions':
+          // resolveSessionApiKey does .eq('status','connected').limit(1).maybeSingle()
+          return { data: SESSION_ROW, error: null }
         default:
           return { data: null, error: null }
       }
@@ -151,36 +140,36 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   isLegacyFormat: vi.fn(() => false),
 }))
 
-const { sendTemplateMessage } = vi.hoisted(() => ({
-  sendTemplateMessage: vi.fn(async () => ({ messageId: 'wamid-1' })),
+const { wasenderSendText } = vi.hoisted(() => ({
+  wasenderSendText: vi.fn(async () => ({ messageId: 'wamid-1' })),
 }))
-vi.mock('@/lib/whatsapp/meta-api', () => ({
-  sendTemplateMessage,
-  sendTextMessage: vi.fn(),
-  sendMediaMessage: vi.fn(),
-}))
+
+vi.mock('@/lib/whatsapp/wasender-send', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/whatsapp/wasender-send')>()
+  return {
+    ...actual,
+    sendTextMessage: wasenderSendText,
+  }
+})
 
 import { POST } from './route'
 
-function postContactTemplate(overrides: Record<string, unknown> = {}) {
+function postContactText(overrides: Record<string, unknown> = {}) {
   return POST(
     new Request('http://localhost/api/whatsapp/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contact_id: 'contact-1',
-        message_type: 'template',
-        template_name: 'order_update',
-        template_language: 'en_US',
-        template_message_params: { body: ['Acme', '#1234'] },
-        template_params: ['Acme', '#1234'],
+        message_type: 'text',
+        content_text: 'Hello from the contact view',
         ...overrides,
       }),
     }),
   )
 }
 
-describe('POST /api/whatsapp/send — contact_id template path', () => {
+describe('POST /api/whatsapp/send — contact_id text path', () => {
   beforeEach(() => {
     conversationInserts.length = 0
     messageInserts.length = 0
@@ -189,44 +178,41 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
     contactRow = CONTACT
     callerRole = 'admin'
     supabaseMock = makeSupabaseMock()
-    sendTemplateMessage.mockClear()
+    wasenderSendText.mockClear()
   })
 
   afterEach(() => {
     vi.clearAllMocks()
   })
 
-  it('creates a conversation for a contact with none, then sends the template', async () => {
-    const res = await postContactTemplate()
+  it('creates a conversation for a contact with none, then sends the text', async () => {
+    const res = await postContactText()
     const json = await res.json()
 
     expect(res.status).toBe(200)
     expect(json.success).toBe(true)
     expect(json.whatsapp_message_id).toBe('wamid-1')
 
-    // A conversation was created for this contact.
     expect(conversationInserts).toHaveLength(1)
     expect(conversationInserts[0]).toMatchObject({
       account_id: 'acct-1',
       contact_id: 'contact-1',
     })
 
-    // The template was sent to the contact's number.
-    expect(sendTemplateMessage).toHaveBeenCalledTimes(1)
-    const args = (sendTemplateMessage.mock.calls[0] as unknown[])[0] as Record<
+    // Sent via the WasenderApi adapter with the decrypted session key.
+    expect(wasenderSendText).toHaveBeenCalledTimes(1)
+    const args = (wasenderSendText.mock.calls[0] as unknown[])[0] as Record<
       string,
       unknown
     >
-    // Meta wants the bare E.164 digits — sanitizePhoneForMeta strips the '+'.
+    expect(args.sessionApiKey).toBe('plaintext-token')
     expect(args.to).toBe('15551234567')
-    expect(args.templateName).toBe('order_update')
+    expect(args.text).toBe('Hello from the contact view')
 
-    // The outbound message was persisted under the new conversation.
     expect(messageInserts).toHaveLength(1)
     expect(messageInserts[0]).toMatchObject({
       conversation_id: 'conv-new',
-      content_type: 'template',
-      template_name: 'order_update',
+      content_type: 'text',
       sender_type: 'agent',
     })
   })
@@ -239,7 +225,7 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
       contact: CONTACT,
     }
 
-    const res = await postContactTemplate()
+    const res = await postContactText()
     expect(res.status).toBe(200)
 
     expect(conversationInserts).toHaveLength(0)
@@ -249,12 +235,12 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
   it('404s when the contact is not in the caller account', async () => {
     contactRow = null
 
-    const res = await postContactTemplate()
+    const res = await postContactText()
     const json = await res.json()
 
     expect(res.status).toBe(404)
     expect(json.error).toMatch(/contact not found/i)
-    expect(sendTemplateMessage).not.toHaveBeenCalled()
+    expect(wasenderSendText).not.toHaveBeenCalled()
   })
 
   it('400s when neither conversation_id nor contact_id is provided', async () => {
@@ -262,7 +248,7 @@ describe('POST /api/whatsapp/send — contact_id template path', () => {
       new Request('http://localhost/api/whatsapp/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message_type: 'template', template_name: 'x' }),
+        body: JSON.stringify({ message_type: 'text', content_text: 'x' }),
       }),
     )
     expect(res.status).toBe(400)
@@ -283,34 +269,29 @@ describe('POST /api/whatsapp/send — role enforcement', () => {
     contactRow = CONTACT
     callerRole = 'admin'
     supabaseMock = makeSupabaseMock()
-    sendTemplateMessage.mockClear()
+    wasenderSendText.mockClear()
   })
 
   afterEach(() => {
     vi.clearAllMocks()
   })
 
-  it('refuses a viewer with 403 and never reaches Meta', async () => {
-    // A viewer is read-only (`canSendMessages`). The route used to resolve
-    // account_id straight off the profile with no role check: RLS blocked
-    // the message INSERT, but the send core calls Meta first, so the
-    // customer still received a real WhatsApp message that RLS could not
-    // un-send. The gate has to come before any outbound call.
+  it('refuses a viewer with 403 and never reaches the provider', async () => {
     callerRole = 'viewer'
 
-    const res = await postContactTemplate()
+    const res = await postContactText()
 
     expect(res.status).toBe(403)
-    expect(sendTemplateMessage).not.toHaveBeenCalled()
+    expect(wasenderSendText).not.toHaveBeenCalled()
     expect(messageInserts).toHaveLength(0)
   })
 
   it('allows an agent through', async () => {
     callerRole = 'agent'
 
-    const res = await postContactTemplate()
+    const res = await postContactText()
 
     expect(res.status).toBe(200)
-    expect(sendTemplateMessage).toHaveBeenCalledTimes(1)
+    expect(wasenderSendText).toHaveBeenCalledTimes(1)
   })
 })

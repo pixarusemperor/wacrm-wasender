@@ -18,16 +18,11 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
-import { decrypt } from '@/lib/whatsapp/encryption';
+import { sendTextMessage, resolveSessionApiKey } from '@/lib/whatsapp/wasender-send';
 import {
   sanitizePhoneForMeta,
   isValidE164,
-  phoneVariants,
-  isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
-import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard';
-import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
 /** Thrown by createBroadcast on a caller-visible failure; route maps it. */
@@ -45,14 +40,14 @@ export class BroadcastError extends Error {
 export interface BroadcastRecipientInput {
   /** E.164 phone. */
   to: string;
-  /** Positional body params for the template ({{1}}, {{2}}…). */
+  /** Kept for API-compat; WasenderApi has no template params. */
   params?: string[];
 }
 
 export interface CreateBroadcastParams {
   name?: string | null;
-  templateName: string;
-  templateLanguage?: string | null;
+  /** Raw text body sent to every recipient (WasenderApi has no templates). */
+  text: string;
   recipients: BroadcastRecipientInput[];
 }
 
@@ -64,11 +59,10 @@ interface PlannedRecipient {
 
 export interface BroadcastPlan {
   broadcastId: string;
-  templateName: string;
-  templateLanguage: string;
-  phoneNumberId: string;
-  accessToken: string;
-  templateRow: MessageTemplate | null;
+  /** Raw text sent to every recipient (WasenderApi has no templates). */
+  textBody: string;
+  /** Decrypted WasenderApi session key for the account. */
+  sessionApiKey: string;
   planned: PlannedRecipient[];
   /** Phones rejected up front (invalid E.164) — counted as failed. */
   rejected: number;
@@ -88,11 +82,10 @@ export async function createBroadcast(
   auditUserId: string,
   params: CreateBroadcastParams
 ): Promise<BroadcastPlan> {
-  const { name, templateName, recipients } = params;
-  const templateLanguage = params.templateLanguage || 'en_US';
+  const { name, text, recipients } = params;
 
-  if (!templateName) {
-    throw new BroadcastError('bad_request', "'template_name' is required", 400);
+  if (!text || !text.trim()) {
+    throw new BroadcastError('bad_request', "'text' is required", 400);
   }
   if (!Array.isArray(recipients) || recipients.length === 0) {
     throw new BroadcastError(
@@ -110,38 +103,8 @@ export async function createBroadcast(
   }
 
   // Config (fail fast + provides the audit trail owner already resolved
-  // by the caller). Meta send needs phone_number_id + decrypted token.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
-  if (configError || !config) {
-    throw new BroadcastError(
-      'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
-      400
-    );
-  }
-  const accessToken = decrypt(config.access_token);
-
-  // Template row (once) for header/button components; guard a
-  // malformed local row rather than N identical opaque failures.
-  const { data: rawTemplateRow } = await db
-    .from('message_templates')
-    .select('*')
-    .eq('account_id', accountId)
-    .eq('name', templateName)
-    .eq('language', templateLanguage)
-    .maybeSingle();
-  if (rawTemplateRow && !isMessageTemplate(rawTemplateRow)) {
-    throw new BroadcastError(
-      'template_malformed',
-      'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before broadcasting.',
-      500
-    );
-  }
-  const templateRow = (rawTemplateRow as MessageTemplate | null) ?? null;
+  // by the caller). WasenderApi sends need the account's session key.
+  const sessionApiKey = await resolveSessionApiKey(db, accountId);
 
   // Resolve each recipient to a contact. Invalid phones are dropped
   // (counted as rejected) rather than aborting the whole broadcast.
@@ -198,9 +161,9 @@ export async function createBroadcast(
     .insert({
       account_id: accountId,
       user_id: auditUserId,
-      name: name || `API broadcast (${templateName})`,
-      template_name: templateName,
-      template_language: templateLanguage,
+      name: name || `API broadcast (${text.slice(0, 40)})`,
+      template_name: null,
+      template_language: null,
       status: 'sending',
       total_recipients: deduped.length,
     })
@@ -236,11 +199,8 @@ export async function createBroadcast(
 
   return {
     broadcastId: broadcast.id,
-    templateName,
-    templateLanguage,
-    phoneNumberId: config.phone_number_id,
-    accessToken,
-    templateRow,
+    textBody: params.text ?? '',
+    sessionApiKey,
     planned,
     rejected,
   };
@@ -266,30 +226,20 @@ export async function deliverBroadcast(
   let sentCount = 0;
 
   for (const recipient of plan.planned) {
-    const variants = phoneVariants(recipient.phone);
     let sentMessageId: string | null = null;
     let lastError: string | null = null;
 
-    for (const variant of variants) {
-      try {
-        const result = await sendTemplateMessage({
-          phoneNumberId: plan.phoneNumberId,
-          accessToken: plan.accessToken,
-          to: variant,
-          templateName: plan.templateName,
-          language: plan.templateLanguage,
-          template: plan.templateRow ?? undefined,
-          params: recipient.params,
-        });
-        sentMessageId = result.messageId;
-        lastError = null;
-        break;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        lastError = message;
-        // Only a "recipient not allowed" error is worth another variant.
-        if (!isRecipientNotAllowedError(message)) break;
-      }
+    try {
+      // Raw text send via WasenderApi (no templates, no phone-variant
+      // retry — the API accepts E.164 directly).
+      const result = await sendTextMessage({
+        sessionApiKey: plan.sessionApiKey,
+        to: recipient.phone,
+        text: plan.textBody,
+      });
+      sentMessageId = result.messageId;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'Unknown error';
     }
 
     if (sentMessageId) {
