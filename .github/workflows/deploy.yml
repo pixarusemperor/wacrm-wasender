@@ -84,13 +84,17 @@ jobs:
         id: trigger
 
       - name: Wait for deployment
-        if: ${{ secrets.COOLIFY_APP_UUID != '' }}
+        # Skips silently when no APP_UUID is configured (webhook-only mode).
         env:
           COOLIFY_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
           COOLIFY_URL: ${{ secrets.COOLIFY_BASE_URL }}
         run: |
           set -euo pipefail
+          if [ -z "${APP_UUID}" ]; then
+            echo "No COOLIFY_APP_UUID — skipping status poll (webhook trigger)."
+            exit 0
+          fi
           BASE="${COOLIFY_URL:-https://coolifyone.orizongroup.online}"
           MAX_ATTEMPTS=40
           INTERVAL=15
