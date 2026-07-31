@@ -54,10 +54,13 @@ jobs:
           BASE="${COOLIFY_URL:-https://coolifyone.orizongroup.online}"
 
           # Preferred: the per-app Deploy Webhook URL (official GitHub
-          # Actions pattern — a GET triggers the deploy, no UUID needed).
+          # Actions pattern — a GET with the token header triggers the
+          # deploy, no UUID needed).
           if [ -n "${COOLIFY_WEBHOOK}" ]; then
             echo "==> Triggering via COOLIFY_WEBHOOK"
-            RESPONSE=$(curl -sk -S --fail-with-body -X GET "${COOLIFY_WEBHOOK}")
+            RESPONSE=$(curl -sk -S --fail-with-body \
+              -X GET "${COOLIFY_WEBHOOK}" \
+              --header "Authorization: Bearer ${COOLIFY_TOKEN}")
             echo "${RESPONSE}" | jq . || echo "${RESPONSE}"
             exit 0
           fi
