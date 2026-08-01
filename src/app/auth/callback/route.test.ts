@@ -54,6 +54,7 @@ beforeEach(() => {
   setAllCalls.length = 0
   process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://test.supabase.co'
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'test-anon-key'
+  process.env.NEXT_PUBLIC_SITE_URL = 'https://wassflow.orizongroup.online'
 })
 
 afterEach(() => {
