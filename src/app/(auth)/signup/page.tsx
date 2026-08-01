@@ -89,6 +89,25 @@ function SignupPageInner() {
     setLoading(false);
   };
 
+  const handleResend = async () => {
+    setLoading(true);
+    setError(null);
+
+    const { error: resendError } = await supabase.auth.resend({
+      type: "signup",
+      email,
+    });
+
+    if (resendError) {
+      setError(resendError.message);
+    } else {
+      setError(
+        "Confirmation email resent. If you still don't see it, check your spam folder or try signing in — your account may already be verified."
+      );
+    }
+    setLoading(false);
+  };
+
   if (success) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background px-4">
@@ -106,7 +125,7 @@ function SignupPageInner() {
               inbox and click the link to verify your account.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="flex flex-col gap-4">
             <Link
               href={
                 inviteToken
@@ -118,9 +137,20 @@ function SignupPageInner() {
                 variant="outline"
                 className="w-full border-border text-muted-foreground hover:bg-muted hover:text-foreground"
               >
-                Back to sign in
+                {inviteToken ? "Back to sign in" : "Already have an account?"}
               </Button>
             </Link>
+            {!inviteToken && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleResend}
+                disabled={loading}
+                className="w-full text-muted-foreground hover:text-foreground"
+              >
+                {loading ? "Resending..." : "Resend confirmation email"}
+              </Button>
+            )}
           </CardContent>
         </Card>
       </div>
