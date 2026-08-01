@@ -116,7 +116,7 @@ describe('/auth/callback route handler', () => {
       'https://wassflow.orizongroup.online/auth/callback?code=bad-code'
     )
 
-    const response = await GET(request)
+    await GET(request)
 
     // The mock setAll was called during exchangeCodeForSession,
     // so cookies should be present on the error response

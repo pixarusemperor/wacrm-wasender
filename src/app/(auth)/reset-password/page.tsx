@@ -14,7 +14,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { KeyRound, CheckCircle } from 'lucide-react'
+import { KeyRound } from 'lucide-react'
 
 const MIN_PASSWORD = 6
 
